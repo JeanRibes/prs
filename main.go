@@ -13,7 +13,7 @@ import (
 const (
 	MTU     = 140
 	WSIZE   = 75
-	TIMEOUT = time.Millisecond * 5000
+	TIMEOUT = time.Millisecond * 10
 )
 const MAX_DATA = MTU - 6
 
@@ -52,7 +52,9 @@ func welcome(conn *net.UDPConn, newport int) (*net.UDPAddr, int) {
 }
 func getfile(conn *net.UDPConn) *os.File {
 	buf := make([]byte, 1000)
-	conn.Read(buf)
+	clearbuf(buf)
+	_, re := conn.Read(buf)
+	e(re)
 	filename := strings.Trim(string(buf), "\x00")
 	println(filename)
 	println(len(filename))
@@ -90,7 +92,7 @@ func prepare_packets(file *os.File) (buffer [][]byte, n int) {
 func sendfile(data_conn *net.UDPConn, client *net.UDPAddr, file *os.File) {
 	paquets, n := prepare_packets(file)
 	timeouts := make([]time.Time, len(paquets))
-	buf := make([]byte, MTU)
+	buf := make([]byte, 32)
 	next_send_seq_num := 1
 	last_received_ack := 0
 	woffset := 1 //le plsu grand ACk reçu + 1
@@ -99,21 +101,21 @@ func sendfile(data_conn *net.UDPConn, client *net.UDPAddr, file *os.File) {
 
 	send_paq := func(seq_num int) {
 		if seq_num == len(paquets)-1 {
-			data_conn.WriteTo(paquets[seq_num-1][0:n], client)
+			data_conn.WriteTo(paquets[seq_num-1][0:n], client) //dernier paquet pas rempli
 		} else {
 			data_conn.WriteTo(paquets[seq_num-1], client)
 		}
 		timeouts[seq_num-1] = time.Now()
 	}
 	on_ack := func() {
-		ack := parse_ack(string(buf[0:6]))
-		println(ack)
-		os.Exit(22)
+		ack := parse_ack(string(buf[3:9]))
+		//	fmt.Printf("ack %d %s\n",ack,string(buf))
 		if ack == last_received_ack {
 			dup_ack_num++
 			if dup_ack_num > 3 {
 				dup_ack_num = 0
 				send_paq(ack + 1)
+				fmt.Printf("dup_ack %d\n", ack)
 			}
 		}
 		last_received_ack = ack
@@ -148,20 +150,21 @@ func sendfile(data_conn *net.UDPConn, client *net.UDPAddr, file *os.File) {
 		}
 
 		// imitation de select()
-		e(data_conn.SetReadDeadline(time.Now().Add(time.Nanosecond + 100)))
-		nr, re := data_conn.Read(buf)
+		e(data_conn.SetReadDeadline(time.Now().Add(time.Microsecond * 100)))
+		_, re := data_conn.Read(buf)
 		if re != nil {
 			if strings.HasSuffix(re.Error(), "i/o timeout") { //pas reçu de ACK
 				on_no_ack()
 			} else {
+				println("vraie erreur")
 				panic(re)
 			}
 		} else { //reçu un ACK
 			on_ack()
 		}
-		if nr > 0 {
+		/*if nr > 0 {
 			on_ack()
-		}
+		}*/
 		//fin imitation select()
 	}
 }
@@ -172,18 +175,26 @@ func rand_port() (newport int) {
 	return newport
 }
 func main() {
-	waddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:5000")
-	welcome_conn, _ := net.ListenUDP("udp", waddr)
 
-	newport := 5000 //rand_port()
+	waddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:5000")
+	welcome_conn, wle := net.ListenUDP("udp", waddr)
+	e(wle)
+
+	newport := rand_port()
 
 	daddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%04d", newport))
-	data_conn, _ := net.ListenUDP("udp", daddr)
+	data_conn, lde := net.ListenUDP("udp", daddr)
+	e(lde)
 
 	client, newport := welcome(welcome_conn, newport) //il faut ouvrir la socket avant car sinon on ne reçoit pas tout
 
 	file := getfile(data_conn)
-	println(client.String(), file)
+	fmt.Printf("%s %s\n", client.String(), file)
+
+	started := time.Now()
+
 	sendfile(data_conn, client, file)
+
+	fmt.Printf("temps: %d\n", time.Since(started).Milliseconds()/1000)
 
 }
