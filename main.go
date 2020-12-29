@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -11,9 +12,11 @@ import (
 )
 
 const (
-	MTU     = 140
-	WSIZE   = 75
-	TIMEOUT = time.Millisecond * 10
+	MTU          = 1400
+	WSIZE        = 95
+	TIMEOUT      = time.Millisecond * 50
+	DUP_ACK_COUT = 2
+	LOOP_WAIT    = time.Nanosecond * 10
 )
 const MAX_DATA = MTU - 6
 
@@ -32,9 +35,7 @@ func welcome(conn *net.UDPConn, newport int) (*net.UDPAddr, int) {
 	for {
 		clearbuf(buf)
 		_, client0, _ := conn.ReadFromUDP(buf)
-		println(string(buf))
 		if string(buf)[0:3] == "SYN" {
-			println("syn")
 			clearbuf(buf)
 			println("new port:", newport)
 			conn.WriteTo([]byte(fmt.Sprintf("SYN-ACK%04d", newport)), client0)
@@ -56,8 +57,6 @@ func getfile(conn *net.UDPConn) *os.File {
 	_, re := conn.Read(buf)
 	e(re)
 	filename := strings.Trim(string(buf), "\x00")
-	println(filename)
-	println(len(filename))
 	file, ferr := os.Open(filename)
 	e(ferr)
 	return file
@@ -67,14 +66,17 @@ func parse_ack(s string) (ack int) {
 	fmt.Sscanf(s, "%06d", &ack)
 	return ack
 }
+func fileSize(file *os.File) int64 {
+	fi, _ := file.Stat()
+	return fi.Size()
+}
 
 /*
 prépare tous les paquets avec le numéro de séquence devant
 */
 func prepare_packets(file *os.File) (buffer [][]byte, n int) {
-	fi, _ := file.Stat()
-	size := fi.Size()
-	num_packets := (size / MTU) + 1
+
+	num_packets := (fileSize(file) / MTU) + 1
 	buffer = make([][]byte, num_packets)
 
 	for i := 0; i < len(buffer); i++ {
@@ -88,85 +90,83 @@ func prepare_packets(file *os.File) (buffer [][]byte, n int) {
 	}
 	return
 }
-
+func progression(woffset *int, max_seq_num int) {
+	m := float64(max_seq_num)
+	for *woffset < max_seq_num {
+		time.Sleep(time.Millisecond * 100)
+		fmt.Printf("\r [%2.0f%%] %d", 100*float64(*woffset)/m, *woffset)
+	}
+}
 func sendfile(data_conn *net.UDPConn, client *net.UDPAddr, file *os.File) {
 	paquets, n := prepare_packets(file)
-	timeouts := make([]time.Time, len(paquets))
+	timeouts := make([]time.Time, len(paquets)+2)
 	buf := make([]byte, 32)
+	max_seq_num := len(paquets)
 	next_send_seq_num := 1
 	last_received_ack := 0
 	woffset := 1 //le plsu grand ACk reçu + 1
 
 	dup_ack_num := 0
 
-	send_paq := func(seq_num int) {
-		if seq_num == len(paquets)-1 {
-			data_conn.WriteTo(paquets[seq_num-1][0:n], client) //dernier paquet pas rempli
-		} else {
-			data_conn.WriteTo(paquets[seq_num-1], client)
-		}
-		timeouts[seq_num-1] = time.Now()
-	}
-	on_ack := func() {
-		ack := parse_ack(string(buf[3:9]))
-		//	fmt.Printf("ack %d %s\n",ack,string(buf))
-		if ack == last_received_ack {
-			dup_ack_num++
-			if dup_ack_num > 3 {
-				dup_ack_num = 0
-				send_paq(ack + 1)
-				fmt.Printf("dup_ack %d\n", ack)
-			}
-		}
-		last_received_ack = ack
-		if last_received_ack > woffset {
-			woffset = last_received_ack + 1
-		}
+	//fmt.Printf("max se qunm %d\n",max_seq_num)
 
+	send_paq := func(seq_num int) {
+		if seq_num <= max_seq_num {
+			if seq_num == max_seq_num {
+				data_conn.WriteTo(paquets[seq_num-1][0:n], client) //dernier paquet pas rempli
+			} else {
+				data_conn.WriteTo(paquets[seq_num-1], client)
+			}
+			timeouts[seq_num-1] = time.Now()
+		}
 	}
 
 	window_control := func() bool {
+		if next_send_seq_num == max_seq_num {
+			return false
+		}
 		if next_send_seq_num < woffset {
 			next_send_seq_num = woffset
 		}
 		return next_send_seq_num < woffset+WSIZE
 	}
-	on_no_ack := func() {
-		if window_control() {
-			send_paq(next_send_seq_num)
-			next_send_seq_num++
-		} else {
-			if time.Since(timeouts[woffset]) > TIMEOUT {
-				send_paq(woffset)
-			}
-		}
-	}
 
-	for {
-
-		if next_send_seq_num == len(paquets) {
-			data_conn.WriteTo([]byte("FIN"), client)
-			return
-		}
-
-		// imitation de select()
-		e(data_conn.SetReadDeadline(time.Now().Add(time.Microsecond * 100)))
-		_, re := data_conn.Read(buf)
-		if re != nil {
-			if strings.HasSuffix(re.Error(), "i/o timeout") { //pas reçu de ACK
-				on_no_ack()
+	go func() {
+		for woffset < max_seq_num {
+			time.Sleep(LOOP_WAIT)
+			if window_control() {
+				send_paq(next_send_seq_num)
+				next_send_seq_num++
 			} else {
-				println("vraie erreur")
-				panic(re)
+				if time.Since(timeouts[woffset]) > TIMEOUT { //-1 +1
+					send_paq(woffset)
+					//fmt.Printf("timeout %d \n", woffset)
+				}
 			}
-		} else { //reçu un ACK
-			on_ack()
 		}
-		/*if nr > 0 {
-			on_ack()
-		}*/
-		//fin imitation select()
+	}()
+	go progression(&woffset, max_seq_num)
+	for woffset < max_seq_num {
+		_, re := data_conn.Read(buf)
+		e(re)
+		ack := parse_ack(string(buf[3:9]))
+		//	fmt.Printf("ack %d %s\n",ack,string(buf))
+		if ack == last_received_ack {
+			dup_ack_num++
+			if dup_ack_num > DUP_ACK_COUT {
+				send_paq(ack + 1)
+				//fmt.Printf("dup_ack %d\n", ack)
+			}
+		}
+		if ack >= last_received_ack {
+			last_received_ack = ack
+		}
+		if last_received_ack > woffset {
+			woffset = last_received_ack + 1
+		}
 	}
+	data_conn.WriteTo([]byte("FIN"), client)
+
 }
 func rand_port() (newport int) {
 	randint, re := rand.Int(rand.Reader, big.NewInt(8975))
@@ -180,21 +180,30 @@ func main() {
 	welcome_conn, wle := net.ListenUDP("udp", waddr)
 	e(wle)
 
-	newport := rand_port()
-
-	daddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%04d", newport))
-	data_conn, lde := net.ListenUDP("udp", daddr)
-	e(lde)
+	var newport int
+	var data_conn *net.UDPConn
+	lde := errors.New("nope")
+	for lde != nil {
+		newport = rand_port()
+		daddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%04d", newport))
+		data_conn, lde = net.ListenUDP("udp", daddr)
+	}
 
 	client, newport := welcome(welcome_conn, newport) //il faut ouvrir la socket avant car sinon on ne reçoit pas tout
 
 	file := getfile(data_conn)
-	fmt.Printf("%s %s\n", client.String(), file)
 
 	started := time.Now()
 
 	sendfile(data_conn, client, file)
 
-	fmt.Printf("temps: %d\n", time.Since(started).Milliseconds()/1000)
+	duree := time.Since(started)
+	debit := float64(fileSize(file)) / duree.Seconds()
+	fmt.Printf("temps: %f s, %f Mo/s\n",
+		float32(duree.Milliseconds())/1000.0,
+		debit/(1000*1000))
+
+	time.Sleep(time.Millisecond * 1)
+	data_conn.WriteTo([]byte("FIN"), client)
 
 }
