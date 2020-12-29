@@ -12,9 +12,9 @@ import (
 
 const (
 	MTU          = 1400
-	WSIZE        = 75
-	TIMEOUT      = time.Millisecond * 100
-	DUP_ACK_COUT = 7
+	WSIZE        = 60
+	TIMEOUT      = time.Millisecond * 900
+	DUP_ACK_COUT = 3
 	LOOP_WAIT    = time.Millisecond * 1
 )
 const MAX_DATA = MTU - 6
@@ -177,12 +177,25 @@ func rand_port() (newport int) {
 	newport = int(randint.Int64() + 1024)
 	return newport
 }
+func save_stats(debit float64, size int64, duree int64) {
+	statsFile, oe := os.OpenFile("stats.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0777)
+	e(oe)
+	_, wse := statsFile.WriteString(fmt.Sprintf("%f Mo/s, %d o, %d s, %d wsize, %d timeout ns, %d dup_ack, %d loopwa_wait ns\n",
+		debit, size, duree, WSIZE, TIMEOUT.Nanoseconds(), DUP_ACK_COUT, LOOP_WAIT.Nanoseconds()))
+	e(wse)
+	statsFile.Close()
+}
+func end_stats() {
+	statsFile, _ := os.OpenFile("stats.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0777)
+	statsFile.WriteString("---------------------------------------------------------------------------------------")
+	statsFile.Close()
+}
 func main() {
 
 	waddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:5000")
 	welcomeConn, wle := net.ListenUDP("udp", waddr)
 	e(wle)
-
+	end_stats()
 	for {
 		newPort := rand_port()
 		daddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%04d", newPort))
@@ -206,6 +219,9 @@ func main() {
 		dataConn.WriteTo([]byte("FIN"), client)
 		e(dataConn.Close())
 		dataConn = nil
+
+		save_stats(debit/(1000*1000), fileSize(file), duree.Milliseconds())
+		file.Close()
 	}
 
 }
