@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/rand"
-	"errors"
 	"fmt"
 	"math/big"
 	"net"
@@ -13,10 +12,10 @@ import (
 
 const (
 	MTU          = 1400
-	WSIZE        = 95
-	TIMEOUT      = time.Millisecond * 50
-	DUP_ACK_COUT = 2
-	LOOP_WAIT    = time.Nanosecond * 10
+	WSIZE        = 75
+	TIMEOUT      = time.Millisecond * 100
+	DUP_ACK_COUT = 7
+	LOOP_WAIT    = time.Millisecond * 1
 )
 const MAX_DATA = MTU - 6
 
@@ -30,19 +29,19 @@ func clearbuf(buf []byte) {
 		buf[i] = 0
 	}
 }
-func welcome(conn *net.UDPConn, newport int) (*net.UDPAddr, int) {
+func welcome(conn *net.UDPConn, newport int) *net.UDPAddr {
 	buf := make([]byte, 100)
 	for {
 		clearbuf(buf)
 		_, client0, _ := conn.ReadFromUDP(buf)
 		if string(buf)[0:3] == "SYN" {
 			clearbuf(buf)
-			println("new port:", newport)
 			conn.WriteTo([]byte(fmt.Sprintf("SYN-ACK%04d", newport)), client0)
-			_, client1, _ := conn.ReadFromUDP(buf)
+			_, client1, re := conn.ReadFromUDP(buf)
+			e(re)
 			if client0.String() == client1.String() {
 				if string(buf)[0:3] == "ACK" {
-					return client1, newport
+					return client1
 				}
 			} else {
 				println("mismatch")
@@ -134,7 +133,7 @@ func sendfile(data_conn *net.UDPConn, client *net.UDPAddr, file *os.File) {
 	go func() {
 		for woffset < max_seq_num {
 			time.Sleep(LOOP_WAIT)
-			if window_control() {
+			if window_control() { //pour le début
 				send_paq(next_send_seq_num)
 				next_send_seq_num++
 			} else {
@@ -164,6 +163,10 @@ func sendfile(data_conn *net.UDPConn, client *net.UDPAddr, file *os.File) {
 		if last_received_ack > woffset {
 			woffset = last_received_ack + 1
 		}
+		if window_control() { //pour le régime
+			send_paq(next_send_seq_num)
+			next_send_seq_num++
+		}
 	}
 	data_conn.WriteTo([]byte("FIN"), client)
 
@@ -177,33 +180,32 @@ func rand_port() (newport int) {
 func main() {
 
 	waddr, _ := net.ResolveUDPAddr("udp", "0.0.0.0:5000")
-	welcome_conn, wle := net.ListenUDP("udp", waddr)
+	welcomeConn, wle := net.ListenUDP("udp", waddr)
 	e(wle)
 
-	var newport int
-	var data_conn *net.UDPConn
-	lde := errors.New("nope")
-	for lde != nil {
-		newport = rand_port()
-		daddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%04d", newport))
-		data_conn, lde = net.ListenUDP("udp", daddr)
+	for {
+		newPort := rand_port()
+		daddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("0.0.0.0:%04d", newPort))
+		dataConn, _ := net.ListenUDP("udp", daddr)
+
+		client := welcome(welcomeConn, newPort) //il faut ouvrir la socket avant car sinon on ne reçoit pas tout
+
+		file := getfile(dataConn)
+
+		started := time.Now()
+
+		sendfile(dataConn, client, file)
+
+		duree := time.Since(started)
+		time.Sleep(time.Millisecond * 200)
+		debit := float64(fileSize(file)) / duree.Seconds()
+		fmt.Printf("\rtemps: %f s, %f Mo/s\n",
+			float32(duree.Milliseconds())/1000.0,
+			debit/(1000*1000))
+
+		dataConn.WriteTo([]byte("FIN"), client)
+		e(dataConn.Close())
+		dataConn = nil
 	}
-
-	client, newport := welcome(welcome_conn, newport) //il faut ouvrir la socket avant car sinon on ne reçoit pas tout
-
-	file := getfile(data_conn)
-
-	started := time.Now()
-
-	sendfile(data_conn, client, file)
-
-	duree := time.Since(started)
-	debit := float64(fileSize(file)) / duree.Seconds()
-	fmt.Printf("temps: %f s, %f Mo/s\n",
-		float32(duree.Milliseconds())/1000.0,
-		debit/(1000*1000))
-
-	time.Sleep(time.Millisecond * 1)
-	data_conn.WriteTo([]byte("FIN"), client)
 
 }
